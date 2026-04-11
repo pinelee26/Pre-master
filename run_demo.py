@@ -10,7 +10,7 @@ Features:
 Usage:
     python run_demo.py
     python run_demo.py --max_new_tokens 512 --compression_interval 64
-    python run_demo.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --long
+    python run_demo.py --model meta-llama/Llama-3.2-1B --long
 """
 
 import argparse
@@ -126,11 +126,11 @@ LONG_PROMPT = (
 
 def main():
     parser = argparse.ArgumentParser(description="Hopfield Streaming Cache Demo (v4)")
-    parser.add_argument("--model", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B")
     parser.add_argument("--prompt", type=str, default=LONG_PROMPT)
-    parser.add_argument("--max_new_tokens", type=int, default=512,
-                        help="Tokens to generate (default 512 for long-context test)")
-    parser.add_argument("--log_every", type=int, default=50,
+    parser.add_argument("--max_new_tokens", type=int, default=2000,
+                        help="Tokens to generate (default 2000 for long-context test)")
+    parser.add_argument("--log_every", type=int, default=200,
                         help="Log KV cache size every N tokens")
 
     # v4 hyperparameters
@@ -201,7 +201,10 @@ def main():
         baseline_out = model.generate(
             **inputs,
             max_new_tokens=args.max_new_tokens,
-            do_sample=False,
+            min_new_tokens=args.max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
             past_key_values=baseline_cache,
             stopping_criteria=StoppingCriteriaList([baseline_monitor]),
         )
@@ -236,7 +239,10 @@ def main():
         compressed_out = model.generate(
             **inputs,
             max_new_tokens=args.max_new_tokens,
-            do_sample=False,
+            min_new_tokens=args.max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
             past_key_values=compressed_cache,
             stopping_criteria=StoppingCriteriaList([compressed_monitor]),
         )

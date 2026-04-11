@@ -10,7 +10,7 @@ Sweeps over (top_k_ratio, chunk_size, window_size) combinations and reports:
 
 Usage:
     python run_sweep.py
-    python run_sweep.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
+    python run_sweep.py --model meta-llama/Llama-3.2-1B
     python run_sweep.py --max_new_tokens 128
 """
 
@@ -118,7 +118,7 @@ LONG_PROMPT = (
 
 def main():
     parser = argparse.ArgumentParser(description="Hopfield Compression Hyperparameter Sweep")
-    parser.add_argument("--model", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B")
     parser.add_argument("--prompt", type=str, default=LONG_PROMPT)
     parser.add_argument("--max_new_tokens", type=int, default=128)
     parser.add_argument("--beta", type=float, default=2.0,
