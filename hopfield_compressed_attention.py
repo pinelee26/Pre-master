@@ -261,8 +261,9 @@ class HopfieldCompressedAttention(LlamaAttention):
     Drop-in replacement for LlamaAttention with Hopfield-compressed KV cache.
 
     v2 improvements:
-      - Prefill-only compression (decode steps just append — no re-compression)
-      - Higher default β=6.0 for sharper prototypes
+      - One-shot compression: compress once when cache first exceeds threshold,
+        then append without re-compressing (no cumulative degradation)
+      - Higher default β=4.0 for sharper prototypes
       - Conservative default top_k_ratio=0.75
       - Multi-step Hopfield update (default 3 steps)
       - Vectorized compression (no Python B×H loops)
@@ -286,12 +287,8 @@ class HopfieldCompressedAttention(LlamaAttention):
         self.rank_iterations = getattr(config, "rank_iterations", 20)
         self.compress_threshold = getattr(config, "compress_threshold", 32)
 
-        # Track whether the initial prefill compression has been done
-        self._prefill_compressed = False
-
-    def _should_compress(self, seq_len: int, is_prefill: bool) -> bool:
-        """Only compress during prefill and when sequence is long enough."""
-        return is_prefill and seq_len >= self.compress_threshold
+        # Track whether compression has been applied (one-shot: compress once, then append)
+        self._compressed = False
 
     def forward(
         self,
@@ -317,15 +314,12 @@ class HopfieldCompressedAttention(LlamaAttention):
                 query_states, key_states, cos, sin,
             )
 
-        # ── Determine prefill vs decode ───────────────────────────────
+        # ── Prepend cached KV ─────────────────────────────────────────
         has_cache = (
             past_key_values is not None
             and self.layer_idx < len(past_key_values.layers)
             and past_key_values.layers[self.layer_idx].is_initialized
         )
-        is_prefill = not has_cache   # First forward = prefill
-
-        # ── Prepend cached KV ─────────────────────────────────────────
         if has_cache:
             cached_layer = past_key_values.layers[self.layer_idx]
             key_states = torch.cat([cached_layer.keys, key_states], dim=2)
@@ -372,8 +366,15 @@ class HopfieldCompressedAttention(LlamaAttention):
 
         attn_output = torch.matmul(attn_probs, value_states_expanded)
 
-        # ── KV compression (prefill only) ─────────────────────────────
-        if self._should_compress(total_seq_len, is_prefill):
+        # ── KV compression (one-shot) ─────────────────────────────────
+        # Compress exactly once: when cache first exceeds threshold.
+        # After that, decode tokens just append to the compressed cache.
+        should_compress = (
+            not self._compressed
+            and total_seq_len >= self.compress_threshold
+        )
+
+        if should_compress:
             with torch.no_grad():
                 # Build KV-KV transition matrix for TokenRank
                 kk = torch.matmul(
@@ -402,9 +403,9 @@ class HopfieldCompressedAttention(LlamaAttention):
                 beta=self.hopfield_beta,
                 num_steps=self.hopfield_steps,
             )
-            self._prefill_compressed = True
+            self._compressed = True
         else:
-            # Decode step or short sequence: keep KV as-is (just appended above)
+            # Either already compressed (append only) or too short — keep as-is
             compressed_k = key_states
             compressed_v = value_states
 
