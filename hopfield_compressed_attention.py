@@ -1,13 +1,26 @@
 """
 Hopfield-Compressed Attention: KV Cache Compression via TokenRank & Modern Hopfield Networks
-(v3 — Observe Window + Soft β)
+(v4 — Streaming Hopfield Cache with Periodic Re-compression)
 
-Key improvements over v2:
-  1. Observe Window: the last N tokens are NEVER compressed — only older tokens
-     are chunked and merged via Hopfield prototypes, preventing repetition loops
-  2. Softer β=2.0 by default — reduces over-attraction to dominant patterns
-  3. 1-step Hopfield update by default — faster with minimal quality loss
-  4. One-shot compression with window-aware split
+Architecture:
+  KV cache is logically split into two regions tracked by _compressed_len:
+
+    [ compressed_kv (prototypes)  |  recent_kv (verbatim)  ]
+    ├── 0 .. _compressed_len ────┤├── sliding window ──────┤
+
+  - During decode, new tokens append to recent_kv.
+  - When recent_kv exceeds (window_size + compression_interval), the oldest
+    compression_interval tokens are popped, Hopfield-compressed into prototypes,
+    and appended to compressed_kv.
+  - recent_kv shrinks back to ~window_size.
+  - This keeps total cache size bounded regardless of generation length.
+
+Key improvements over v3:
+  1. Periodic re-compression during decode (not just one-shot at prefill)
+  2. Dual-region cache with tracked boundary (_compressed_len)
+  3. Bounded memory: cache grows at a fraction of the generation rate
+  4. Overflow chunks are ALL compressed (no TokenRank needed for periodic passes)
+  5. Initial prefill still uses TokenRank for intelligent first compression
 
 Reference equations:
   - TokenRank: π = πP   (left eigenvector / steady-state of DTMC)
@@ -37,32 +50,17 @@ def compute_token_rank(
     num_iterations: int = 20,
     epsilon: float = 1e-6,
 ) -> torch.Tensor:
-    """
-    Compute TokenRank via power iteration on the transpose of the
-    attention transition matrix.
-
-    Args:
-        attn_weights: (B, H, S, S) — row-stochastic (post-softmax).
-        num_iterations: power-iteration steps.
-        epsilon: numerical stability constant.
-
-    Returns:
-        token_rank: (B, H, S) — importance score per token per head.
-    """
     P_T = attn_weights.transpose(-2, -1)
     S = attn_weights.shape[-1]
-
     pi = attn_weights.new_ones(*attn_weights.shape[:-1]) / S
-
     for _ in range(num_iterations):
         pi = torch.einsum("bhij,bhj->bhi", P_T, pi)
         pi = pi / (pi.sum(dim=-1, keepdim=True) + epsilon)
-
     return pi
 
 
 # ---------------------------------------------------------------------------
-# 2. Chunk-level compression decision
+# 2. Chunk-level compression decision (used for initial prefill only)
 # ---------------------------------------------------------------------------
 
 def identify_chunks(
@@ -70,28 +68,16 @@ def identify_chunks(
     chunk_size: int = 8,
     top_k_ratio: float = 0.65,
 ) -> Tuple[torch.Tensor, int]:
-    """
-    Partition the sequence into fixed-size chunks and mark which to compress
-    based on aggregate TokenRank mass.
-
-    Returns:
-        compress_mask: (B, H, num_chunks) bool — True = compress.
-        num_chunks: int
-    """
     B, H, S = token_rank.shape
     pad = (chunk_size - S % chunk_size) % chunk_size
     if pad > 0:
         token_rank = F.pad(token_rank, (0, pad), value=0.0)
-
     num_chunks = token_rank.shape[-1] // chunk_size
     chunk_scores = token_rank.view(B, H, num_chunks, chunk_size).sum(dim=-1)
-
     k = max(1, int(num_chunks * top_k_ratio))
     topk_vals, _ = chunk_scores.topk(k, dim=-1)
     threshold = topk_vals[..., -1:]
-
     compress_mask = chunk_scores < threshold
-
     return compress_mask, num_chunks
 
 
@@ -105,30 +91,25 @@ def hopfield_prototype_batched(
     num_steps: int = 1,
 ) -> torch.Tensor:
     """
-    Batched multi-step Modern Hopfield update.
-
     ξ_{t+1} = X^T softmax(β X ξ_t)
 
     Args:
-        X: (*, N, D) — stored patterns (last two dims are patterns x features).
+        X: (*, N, D) — stored patterns.
         beta: inverse temperature.
-        num_steps: number of iterative updates toward the fixed-point attractor.
-
+        num_steps: iteration count.
     Returns:
-        prototype: (*, D) — fused prototype per batch element.
+        prototype: (*, D)
     """
     xi = X.mean(dim=-2)
-
     for _ in range(num_steps):
         logits = beta * torch.einsum("...nd,...d->...n", X, xi)
         weights = F.softmax(logits, dim=-1)
         xi = torch.einsum("...nd,...n->...d", X, weights)
-
     return xi
 
 
 # ---------------------------------------------------------------------------
-# 4. Vectorized KV compression (window-aware)
+# 4. KV compression functions
 # ---------------------------------------------------------------------------
 
 def compress_kv_with_hopfield(
@@ -140,28 +121,13 @@ def compress_kv_with_hopfield(
     num_steps: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Hopfield prototype merging for selected chunks.
-
-    Compressed chunks  -> 1 prototype token (Hopfield update)
-    Preserved  chunks  -> all chunk_size tokens kept verbatim
-
-    Args:
-        key_states:    (B, H_kv, S, D) — only the compressible region
-        value_states:  (B, H_kv, S, D)
-        compress_mask: (B, H_kv, num_chunks) bool
-        chunk_size:    tokens per chunk
-        beta:          Hopfield inverse temperature
-        num_steps:     Hopfield iteration count
-
-    Returns:
-        compressed_keys:   (B, H_kv, S', D)
-        compressed_values: (B, H_kv, S', D)
+    Selective Hopfield compression (used for initial prefill with TokenRank).
+    compress_mask determines which chunks to compress vs preserve verbatim.
     """
     B, H, S, D = key_states.shape
     device = key_states.device
     dtype = key_states.dtype
 
-    # Pad to chunk-aligned length
     pad = (chunk_size - S % chunk_size) % chunk_size
     if pad > 0:
         key_states = F.pad(key_states, (0, 0, 0, pad))
@@ -170,33 +136,26 @@ def compress_kv_with_hopfield(
     S_padded = key_states.shape[2]
     num_chunks = S_padded // chunk_size
 
-    # Reshape: (B, H, num_chunks, chunk_size, D)
     k_chunks = key_states.view(B, H, num_chunks, chunk_size, D)
     v_chunks = value_states.view(B, H, num_chunks, chunk_size, D)
 
-    # Compute prototypes for ALL chunks (vectorized): (B, H, num_chunks, D)
     k_protos = hopfield_prototype_batched(k_chunks, beta=beta, num_steps=num_steps)
     v_protos = hopfield_prototype_batched(v_chunks, beta=beta, num_steps=num_steps)
 
-    # Tokens per chunk: compressed -> 1, preserved -> chunk_size
     tokens_per_chunk = torch.where(
         compress_mask,
         torch.ones_like(compress_mask, dtype=torch.long),
         torch.full_like(compress_mask, chunk_size, dtype=torch.long),
     )
-
     total_tokens = tokens_per_chunk.sum(dim=-1)
     S_out = total_tokens.max().item()
 
     out_k = torch.zeros(B, H, S_out, D, device=device, dtype=dtype)
     out_v = torch.zeros(B, H, S_out, D, device=device, dtype=dtype)
-
     write_pos = torch.zeros(B, H, device=device, dtype=torch.long)
 
     for c in range(num_chunks):
         mask_c = compress_mask[:, :, c]
-
-        # Compressed path: 1 prototype token
         b_comp, h_comp = torch.where(mask_c)
         if b_comp.numel() > 0:
             pos = write_pos[b_comp, h_comp]
@@ -204,7 +163,6 @@ def compress_kv_with_hopfield(
             out_v[b_comp, h_comp, pos] = v_protos[b_comp, h_comp, c]
             write_pos[b_comp, h_comp] += 1
 
-        # Preserved path: chunk_size tokens
         b_keep, h_keep = torch.where(~mask_c)
         if b_keep.numel() > 0:
             for t in range(chunk_size):
@@ -216,31 +174,73 @@ def compress_kv_with_hopfield(
     return out_k, out_v
 
 
+def compress_all_chunks(
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    chunk_size: int,
+    beta: float,
+    num_steps: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compress ALL chunks unconditionally (used for periodic re-compression).
+    Each chunk of chunk_size tokens → 1 prototype token.
+
+    Args:
+        key_states:   (B, H, S, D) — the overflow region to compress
+        value_states: (B, H, S, D)
+    Returns:
+        proto_keys:   (B, H, num_chunks, D) — one prototype per chunk
+        proto_values: (B, H, num_chunks, D)
+    """
+    B, H, S, D = key_states.shape
+
+    # Truncate to chunk-aligned length (discard trailing partial chunk)
+    num_chunks = S // chunk_size
+    usable_len = num_chunks * chunk_size
+
+    if num_chunks == 0:
+        # Not enough tokens for even one chunk — return empty
+        return (
+            key_states.new_zeros(B, H, 0, D),
+            value_states.new_zeros(B, H, 0, D),
+        )
+
+    k_chunks = key_states[:, :, :usable_len, :].view(B, H, num_chunks, chunk_size, D)
+    v_chunks = value_states[:, :, :usable_len, :].view(B, H, num_chunks, chunk_size, D)
+
+    k_protos = hopfield_prototype_batched(k_chunks, beta=beta, num_steps=num_steps)
+    v_protos = hopfield_prototype_batched(v_chunks, beta=beta, num_steps=num_steps)
+
+    return k_protos, v_protos  # (B, H, num_chunks, D)
+
+
 # ---------------------------------------------------------------------------
-# 5. Main Attention Module
+# 5. Main Attention Module — Streaming Hopfield Cache
 # ---------------------------------------------------------------------------
 
 class HopfieldCompressedAttention(LlamaAttention):
     """
-    Drop-in replacement for LlamaAttention with Hopfield-compressed KV cache.
+    Drop-in replacement for LlamaAttention with streaming Hopfield KV cache.
 
-    v3 — Observe Window + Soft Beta:
-      - Hybrid observe window: last `window_size` tokens are NEVER compressed,
-        only older tokens are chunked and merged via Hopfield prototypes.
-        This prevents repetition loops by preserving recent context verbatim.
-      - Softer β=2.0 reduces over-attraction to dominant attractor patterns
-      - 1-step Hopfield update for speed with minimal quality trade-off
-      - One-shot compression: compress once when cache exceeds threshold,
-        then append without re-compressing
+    v4 — Periodic Re-compression:
+      The KV cache is logically split at _compressed_len:
+
+        [ compressed_kv | recent_kv ]
+
+      During decode, new tokens append to recent_kv. When recent_kv exceeds
+      (window_size + compression_interval), the oldest compression_interval
+      tokens overflow, get Hopfield-compressed into prototypes, and append
+      to compressed_kv. This keeps memory bounded.
 
     Hyperparameters (set via config attributes):
-        hopfield_beta          Inverse temperature for Hopfield update     (default: 2.0)
-        hopfield_steps         Hopfield iteration count per prototype      (default: 1)
-        chunk_size             Tokens per compression chunk                (default: 8)
-        top_k_ratio            Fraction of chunks to keep uncompressed     (default: 0.65)
-        rank_iterations        Power-iteration steps for TokenRank         (default: 20)
-        compress_threshold     Minimum seq length to trigger compression   (default: 32)
-        window_size            Recent tokens to keep uncompressed          (default: 32)
+        hopfield_beta           Inverse temperature                     (default: 2.0)
+        hopfield_steps          Hopfield iterations per prototype       (default: 1)
+        chunk_size              Tokens per compression chunk            (default: 8)
+        top_k_ratio             Chunks to keep in initial compression   (default: 0.65)
+        rank_iterations         Power-iteration steps for TokenRank     (default: 20)
+        compress_threshold      Min seq length for first compression    (default: 32)
+        window_size             Recent tokens always kept verbatim      (default: 32)
+        compression_interval    New tokens before periodic recompress   (default: 64)
     """
 
     def __init__(self, config: LlamaConfig, layer_idx: int):
@@ -253,9 +253,11 @@ class HopfieldCompressedAttention(LlamaAttention):
         self.rank_iterations = getattr(config, "rank_iterations", 20)
         self.compress_threshold = getattr(config, "compress_threshold", 32)
         self.window_size = getattr(config, "window_size", 32)
+        self.compression_interval = getattr(config, "compression_interval", 64)
 
-        # One-shot flag: compress once, then append
-        self._compressed = False
+        # Streaming state
+        self._compressed_len = 0    # boundary: tokens [0:_compressed_len] are prototypes
+        self._initialized = False   # has initial compression been done?
 
     def forward(
         self,
@@ -294,17 +296,16 @@ class HopfieldCompressedAttention(LlamaAttention):
 
         total_seq_len = key_states.shape[2]
 
-        # ── GQA expansion for attention computation ───────────────────
+        # ── GQA expansion for attention ───────────────────────────────
         key_states_expanded = repeat_kv(key_states, self.num_key_value_groups)
         value_states_expanded = repeat_kv(value_states, self.num_key_value_groups)
 
-        # ── Scaled dot-product attention (explicit) ───────────────────
+        # ── Scaled dot-product attention ──────────────────────────────
         attn_weights = torch.matmul(
             query_states,
             key_states_expanded.transpose(-2, -1),
         ) * self.scaling
 
-        # Causal mask
         if attention_mask is not None:
             causal_len = attn_weights.shape[-1]
             if attention_mask.dim() == 2:
@@ -327,50 +328,53 @@ class HopfieldCompressedAttention(LlamaAttention):
         attn_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
             query_states.dtype,
         )
-
         if self.training:
             attn_probs = F.dropout(attn_probs, p=self.attention_dropout)
 
         attn_output = torch.matmul(attn_probs, value_states_expanded)
 
-        # ── KV compression (one-shot, window-aware) ───────────────────
+        # ==============================================================
+        # KV COMPRESSION — Streaming Hopfield Cache
+        # ==============================================================
         #
-        # Layout after compression:
-        #   [ compressed_old_tokens | recent_window_tokens ]
-        #         ^                         ^
-        #   Hopfield prototypes       verbatim (never touched)
+        # Cache layout:  [ compressed_kv | recent_kv ]
+        #                  0.._compressed_len  _compressed_len..total
         #
-        should_compress = (
-            not self._compressed
-            and total_seq_len >= self.compress_threshold
-        )
+        # Two compression paths:
+        #   A) Initial compression: first time total exceeds threshold
+        #      → TokenRank-based selective compression on old tokens
+        #   B) Periodic re-compression: recent_kv overflows
+        #      → compress ALL overflow chunks unconditionally
+        # ==============================================================
 
-        if should_compress:
-            # Split: compressible region vs observe window
+        recent_len = total_seq_len - self._compressed_len
+        max_recent = self.window_size + self.compression_interval
+        did_compress = False
+
+        # ── Path A: Initial compression ───────────────────────────────
+        if not self._initialized and total_seq_len >= self.compress_threshold:
             window = min(self.window_size, total_seq_len)
-            compress_len = total_seq_len - window
+            compress_region_len = total_seq_len - window
 
-            if compress_len >= self.chunk_size:
-                # Slice into old (compressible) and recent (protected)
-                k_old = key_states[:, :, :compress_len, :]
-                v_old = value_states[:, :, :compress_len, :]
-                k_recent = key_states[:, :, compress_len:, :]
-                v_recent = value_states[:, :, compress_len:, :]
+            if compress_region_len >= self.chunk_size:
+                k_old = key_states[:, :, :compress_region_len, :]
+                v_old = value_states[:, :, :compress_region_len, :]
+                k_recent = key_states[:, :, compress_region_len:, :]
+                v_recent = value_states[:, :, compress_region_len:, :]
 
                 with torch.no_grad():
-                    # TokenRank on the compressible region only
                     kk = torch.matmul(
                         k_old, k_old.transpose(-2, -1),
                     ) * self.scaling
                     causal_kk = torch.triu(
                         torch.full(
-                            (compress_len, compress_len), float("-inf"),
+                            (compress_region_len, compress_region_len),
+                            float("-inf"),
                             device=kk.device, dtype=kk.dtype,
                         ),
                         diagonal=1,
                     )
                     P = F.softmax(kk + causal_kk, dim=-1)
-
                     token_rank = compute_token_rank(
                         P, num_iterations=self.rank_iterations,
                     )
@@ -380,7 +384,6 @@ class HopfieldCompressedAttention(LlamaAttention):
                         top_k_ratio=self.top_k_ratio,
                     )
 
-                # Compress old region
                 comp_k, comp_v = compress_kv_with_hopfield(
                     k_old, v_old,
                     compress_mask,
@@ -389,18 +392,51 @@ class HopfieldCompressedAttention(LlamaAttention):
                     num_steps=self.hopfield_steps,
                 )
 
-                # Concat: compressed_old + recent_window
-                compressed_k = torch.cat([comp_k, k_recent], dim=2)
-                compressed_v = torch.cat([comp_v, v_recent], dim=2)
-            else:
-                # Not enough old tokens to form even one chunk — keep as-is
-                compressed_k = key_states
-                compressed_v = value_states
+                key_states = torch.cat([comp_k, k_recent], dim=2)
+                value_states = torch.cat([comp_v, v_recent], dim=2)
+                self._compressed_len = comp_k.shape[2]
+                self._initialized = True
+                did_compress = True
 
-            self._compressed = True
-        else:
-            compressed_k = key_states
-            compressed_v = value_states
+        # ── Path B: Periodic re-compression ───────────────────────────
+        elif self._initialized and recent_len > max_recent:
+            # How many tokens overflowed past (window + interval)?
+            overflow_count = recent_len - self.window_size
+            # Align to chunk_size (only compress full chunks)
+            overflow_chunks = overflow_count // self.chunk_size
+            overflow_aligned = overflow_chunks * self.chunk_size
+
+            if overflow_aligned >= self.chunk_size:
+                # Split cache into three regions:
+                #   [existing_compressed | overflow | kept_recent]
+                split_point = self._compressed_len + overflow_aligned
+
+                k_existing = key_states[:, :, :self._compressed_len, :]
+                v_existing = value_states[:, :, :self._compressed_len, :]
+
+                k_overflow = key_states[:, :, self._compressed_len:split_point, :]
+                v_overflow = value_states[:, :, self._compressed_len:split_point, :]
+
+                k_kept = key_states[:, :, split_point:, :]
+                v_kept = value_states[:, :, split_point:, :]
+
+                # Compress ALL overflow chunks → prototypes
+                with torch.no_grad():
+                    k_new_protos, v_new_protos = compress_all_chunks(
+                        k_overflow, v_overflow,
+                        chunk_size=self.chunk_size,
+                        beta=self.hopfield_beta,
+                        num_steps=self.hopfield_steps,
+                    )
+
+                # Reassemble: [existing_compressed + new_protos | kept_recent]
+                new_compressed_k = torch.cat([k_existing, k_new_protos], dim=2)
+                new_compressed_v = torch.cat([v_existing, v_new_protos], dim=2)
+
+                key_states = torch.cat([new_compressed_k, k_kept], dim=2)
+                value_states = torch.cat([new_compressed_v, v_kept], dim=2)
+                self._compressed_len = new_compressed_k.shape[2]
+                did_compress = True
 
         # ── Update KV cache ───────────────────────────────────────────
         if past_key_values is not None:
@@ -416,8 +452,8 @@ class HopfieldCompressedAttention(LlamaAttention):
                     ),
                     layer_idx=len(past_key_values.layers),
                 )
-            past_key_values.layers[self.layer_idx].keys = compressed_k
-            past_key_values.layers[self.layer_idx].values = compressed_v
+            past_key_values.layers[self.layer_idx].keys = key_states
+            past_key_values.layers[self.layer_idx].values = value_states
 
         # ── Output projection ─────────────────────────────────────────
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()

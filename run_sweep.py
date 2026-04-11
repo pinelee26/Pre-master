@@ -86,11 +86,13 @@ def inject_hopfield_attention(model):
     return model
 
 
-def reset_compression_flags(model):
-    """Reset _compressed flags on all attention layers for a fresh run."""
+def reset_compression_state(model):
+    """Reset streaming state on all attention layers for a fresh run."""
     for layer in model.model.layers:
-        if hasattr(layer.self_attn, "_compressed"):
-            layer.self_attn._compressed = False
+        attn = layer.self_attn
+        if hasattr(attn, "_initialized"):
+            attn._initialized = False
+            attn._compressed_len = 0
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +189,12 @@ def main():
     beta = args.beta
     steps = args.hopfield_steps
 
-    # Inject once — we'll reset flags between runs
+    # Inject once — we'll reset state between runs
     model.config.hopfield_beta = beta
     model.config.hopfield_steps = steps
     model.config.compress_threshold = 32
     model.config.rank_iterations = 20
+    model.config.compression_interval = 64
     # Set initial values (will be overwritten per run)
     model.config.chunk_size = 8
     model.config.top_k_ratio = 0.65
@@ -236,7 +239,8 @@ def main():
             attn.top_k_ratio = tkr
             attn.chunk_size = cs
             attn.window_size = ws
-            attn._compressed = False  # Reset for fresh compression
+            attn._initialized = False
+            attn._compressed_len = 0
 
         t0 = time.time()
         with torch.no_grad():
