@@ -5,7 +5,7 @@ Usage:
     python run_demo.py                           # Use a small Llama model from HF
     python run_demo.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
     python run_demo.py --prompt "The future of AI is"
-    python run_demo.py --beta 4.0 --chunk_size 8 --top_k_ratio 0.75
+    python run_demo.py --beta 2.0 --chunk_size 8 --top_k_ratio 0.65 --window_size 32
 """
 
 import argparse
@@ -38,7 +38,8 @@ def inject_hopfield_attention(model, config):
 
     print(f"[+] Replaced {replaced} attention layers with HopfieldCompressedAttention")
     print(f"    beta={model.config.hopfield_beta}, steps={model.config.hopfield_steps}, "
-          f"chunk_size={model.config.chunk_size}, top_k_ratio={model.config.top_k_ratio}")
+          f"chunk_size={model.config.chunk_size}, top_k_ratio={model.config.top_k_ratio}, "
+          f"window={model.config.window_size}")
     return model
 
 
@@ -62,19 +63,21 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=64,
                         help="Number of tokens to generate")
 
-    # Hopfield compression hyperparameters (v2 defaults)
-    parser.add_argument("--beta", type=float, default=4.0,
+    # Hopfield compression hyperparameters (v3 defaults)
+    parser.add_argument("--beta", type=float, default=2.0,
                         help="Hopfield inverse temperature (higher = sharper prototype)")
-    parser.add_argument("--hopfield_steps", type=int, default=3,
+    parser.add_argument("--hopfield_steps", type=int, default=1,
                         help="Hopfield update iterations per prototype")
     parser.add_argument("--chunk_size", type=int, default=8,
                         help="Tokens per chunk for compression")
-    parser.add_argument("--top_k_ratio", type=float, default=0.75,
+    parser.add_argument("--top_k_ratio", type=float, default=0.65,
                         help="Fraction of chunks to keep uncompressed")
     parser.add_argument("--compress_threshold", type=int, default=32,
                         help="Min sequence length to trigger compression")
     parser.add_argument("--rank_iterations", type=int, default=20,
                         help="Power-iteration steps for TokenRank")
+    parser.add_argument("--window_size", type=int, default=32,
+                        help="Recent tokens to keep uncompressed (observe window)")
 
     # Device
     parser.add_argument("--device", type=str, default=None,
@@ -111,6 +114,7 @@ def main():
     model.config.top_k_ratio = args.top_k_ratio
     model.config.compress_threshold = args.compress_threshold
     model.config.rank_iterations = args.rank_iterations
+    model.config.window_size = args.window_size
 
     inputs = tokenizer(args.prompt, return_tensors="pt").to(device)
 
@@ -142,7 +146,7 @@ def main():
 
     # ── Compressed generation ─────────────────────────────────────
     print("\n" + "=" * 70)
-    print("  HOPFIELD-COMPRESSED ATTENTION (v2)")
+    print("  HOPFIELD-COMPRESSED ATTENTION (v3)")
     print("=" * 70)
 
     t0 = time.time()
